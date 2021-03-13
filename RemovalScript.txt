@@ -1,0 +1,28 @@
+
+Logon to EC2 machine as ec2-user
+cd /home/ec2-user
+rm -rf creditcardproject
+
+Run the following commands to clean up hadoop file system 
+
+hadoop fs -rm -r /user/ec2-user/CCFraudDetection/input/awsrdstables/card_member
+hadoop fs -rm -r /user/ec2-user/CCFraudDetection/input/awsrdstables/member_score
+hadoop fs -rm -r /user/ec2-user/CCFraudDetection/input
+hadoop fs -rm -r /user/ec2-user/CCFraudDetection
+
+hbase shell 
+disable 'card_transactions_master'
+drop 'card_transactions_master'
+disable 'card_transaction_lookup'
+drop 'card_transaction_lookup'
+
+hive
+DROP TABLE IF EXISTS card_transactions_hbase_master; 
+DROP TABLE IF EXISTS card_transactions_history_data; 
+DROP TABLE IF EXISTS card_member; 
+DROP TABLE IF EXISTS member_score; 
+DROP TABLE IF EXISTS card_transactions_lookup;
+DROP TABLE IF EXISTS card_score;
+DROP TABLE IF EXISTS card_last_ten_transactions;
+DROP TABLE IF EXISTS card_ucl;
+DROP TABLE IF EXISTS card_zipcode;
