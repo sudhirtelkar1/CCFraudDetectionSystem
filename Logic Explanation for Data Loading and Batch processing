@@ -1,0 +1,119 @@
+Step 1 : Start the EC2 cloudera enabled server, create folders in hdfs & copy card transaction history file to hdfs.
+
+I.	Log on to EC2 machine as ec2-user & create folders
+	Run the following commmands from /home/ec2-user
+	mkdir creditcardproject
+	cd creditcardproject
+	mkdir inpdata
+	mkdir src
+	cd src
+	mkdir db
+	mkdir rules
+	cd /home/ec2-user
+
+II.	Copy the files from local to the EC2 machine 
+	WinSCP the card_transactions.csv file into creditcardproject/inpdata/. 
+	WinSCP the geo_map.py file into creditcardproject/src/rules/
+	WinSCP the dao.py file into creditcardproject/src/db/
+
+III.	HADOOP commands for directory creation in hdfs 
+	hadoop fs -mkdir /user/ec2-user/CCFraudDetection
+	hadoop fs -mkdir /user/ec2-user/CCFraudDetection/input
+
+IV.	Copy card transaction history data to hdfs 
+	hadoop fs -put /home/ec2-user/creditcardproject/inpdata/card_transactions.csv /user/ec2-user/CCFraudDetection/input/
+
+Step 2: Load the transactions history data (card_transactions.csv) in a NoSQL ( Hbase ).
+
+The "card_transactions_master" table in Hbase which is integrated with hive table "card_transactions_hbase_master" houses the card transaction history data which is 53292 rows.
+
+I.	Create a new hbase table via hive shell. We are creating "card_transactions_hbase_master" table in Hive and "card_transactions_master" table in HBase. This table will contain 8 columns in Hive. These are mapped to hbase table with two column families 'cardDetail' and 'transactionDetail'. Here “:key” is specified at the beginning of “hbase.columns.mapping” property which automatically maps to first column (rowid STRING) in Hive table.  
+	create external table if not exists card_transactions_hbase_master (rowid STRING, card_id BIGINT, member_id BIGINT, amount DOUBLE, postcode INT, pos_id BIGINT, transaction_dt STRING, status STRING) STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler' WITH SERDEPROPERTIES ("hbase.columns.mapping" = ":key, cardDetail:card_id, cardDetail:member_id, transactionDetail:amount, transactionDetail:postcode, transactionDetail:pos_id, transactionDetail:transaction_dt, transactionDetail:status") tblproperties("hbase.table.name"="card_transactions_master");
+
+II.	We cannot directly load data into hbase table “card_transaction_master table” with load data inpath hive command. We have to copy data into it from another Hive table. Create another hive table “card_transactions_history_data” with the same schema as “card_transactions_hbase_master” and we will insert records into it with hive load data input command.
+	create external table if not exists card_transactions_history_data (card_id BIGINT, member_id BIGINT, amount DOUBLE, postcode INT, pos_id BIGINT, transaction_dt STRING, status STRING) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' LOCATION '/user/ec2-user/CCFraudDetection/input/hive/' tblproperties("skip.header.line.count"="1");
+	load data inpath '/user/ec2-user/CCFraudDetection/input/card_transactions.csv' overwrite into table card_transactions_history_data;
+
+III.	Copy contents into “card_transactions_hbase_master” table from “card_transactions_history_data” and verify its contents in hive as well as in hbase
+	insert overwrite table card_transactions_hbase_master select regexp_replace(reflect('java.util.UUID','randomUUID'), '-', '') as rowid, card_id, member_id, amount, postcode, pos_id, transaction_dt, status from card_transactions_history_data;
+
+Step 3 : Load card_member and member_score data from AWS RDS into hdfs and then create hive tables. 
+
+I.	Use sqoop to import card_member and member_score data from AWS RDS into hdfs
+sqoop import \
+--connect jdbc:mysql://awsrds1.cyaielc9bmnf.us-east-1.rds.amazonaws.com/cred_financials_data \
+--username user \
+--password user \
+--table card_member \
+--target-dir /user/ec2-user/CCFraudDetection/input/awsrdstables/card_member
+
+
+sqoop import \
+--connect jdbc:mysql://awsrds1.cyaielc9bmnf.us-east-1.rds.amazonaws.com/cred_financials_data \
+--table member_score \
+--username user --password user \
+--target-dir /user/ec2-user/CCFraudDetection/input/awsrdstables/member_score
+
+II.	Create hive tables for card_member and member_score data. 
+create external table if not exists card_member (card_id BIGINT, member_id BIGINT, member_joining_dt STRING, card_purchase_dt STRING, country STRING, city STRING) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' LOCATION '/user/ec2-user/CCFraudDetection/input/hive/card_member/';
+
+create external table if not exists member_score (member_id BIGINT, score INT) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' LOCATION '/user/ec2-user/CCFraudDetection/input/hive/member_score/';
+
+III.	Load data into Hive tables for card_member and member_score from hdfs
+load data inpath '/user/ec2-user/CCFraudDetection/input/awsrdstables/card_member/part*' overwrite into table card_member; 
+
+load data inpath '/user/ec2-user/CCFraudDetection/input/awsrdstables/member_score/part*' overwrite into table member_score;
+
+Step 4 : Create look up table. 
+
+I.	Create lookup table in Hbase using hive integration. We are creating " card_transactions_lookup " table in Hive and " card_transaction_lookup" table in HBase. This table will contain 5 columns in Hive. These are mapped to hbase table with one column families 'cfl'. Here “:key” is specified at the beginning of “hbase.columns.mapping” property which automatically maps to first column (card_id BIGINT) in Hive table.  
+create table if not exists card_transactions_lookup
+(card_id BIGINT, ucl DOUBLE, postcode INT, transaction_dt STRING, score INT)
+STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler' WITH SERDEPROPERTIES ("hbase.columns.mapping" = ":key,
+cf:ucl, cf:postcode, cf:transaction_dt, cf:score")
+tblproperties("hbase.table.name"="card_transaction_lookup");
+
+ 
+Step 5 : Solution to batch layer problem and populating look up table. 
+
+The batch layer problem is resolved through the following approach. 
+•	Use Hive, to calculate Ucl, creditscore, postcode and transaction_dt for each card_id
+•	Creating staging tables for each column of look up table to hold intermediate outputs
+•	Use Hive to integrate all the intermediate outputs and populate the look up table
+
+I.	Creating staging tables to hold intermediate outputs
+create external table if not exists card_score
+(card_id BIGINT, score INT) 
+STORED as ORC
+LOCATION '/user/ec2-user/CCFraudDetection/input/hive/card_score/'
+tblproperties ("orc.compress"="SNAPPY");
+
+create external table if not exists card_last_ten_transactions
+(card_id BIGINT, amount DOUBLE, postcode INT, transaction_dt STRING, status STRING)
+STORED as ORC
+LOCATION '/user/ec2-user/CCFraudDetection/input/hive/card_last_ten_transactions/'
+tblproperties ("orc.compress"="SNAPPY");
+
+create external table if not exists card_ucl
+(card_id BIGINT, ucl DOUBLE)
+STORED as ORC
+LOCATION '/user/ec2-user/CCFraudDetection/input/hive/card_ucl/'
+tblproperties ("orc.compress"="SNAPPY");
+
+create external table if not exists card_zipcode
+(card_id BIGINT, postcode INT, transaction_dt STRING)
+STORED as ORC
+LOCATION '/user/ec2-user/CCFraudDetection/input/hive/card_zipcode/'
+tblproperties ("orc.compress"="SNAPPY");
+
+II.	For each card Id, calculate the ucl, creditscore, postcode and transaction dt & populate staging tables. 
+insert overwrite table card_score select cm.card_id, ms.score from card_member cm inner join member_score ms on cm.member_id = ms.member_id;
+
+insert overwrite table card_last_ten_transactions select card_id,amount, postcode, transaction_dt, status from (select card_id, member_id, amount, postcode, pos_id, transaction_dt, status, ROW_NUMBER() OVER (PARTITION BY card_id ORDER BY unix_timestamp(transaction_dt,'yyyy-MM-dd hh:mm:ss') DESC) AS ROW_NUMBER from card_transactions_hbase_master where status = 'GENUINE') master where master.ROW_NUMBER <= 10;
+
+insert overwrite table card_ucl select card_id, (MovingAverage+3*StandardDeviation) as UCL from (select card_id, AVG(amount) as MovingAverage, STDDEV(amount) as StandardDeviation from card_last_ten_transactions group by card_id) temp;
+
+insert overwrite table card_zipcode select card_id, postcode, transaction_dt from (select card_id, postcode, transaction_dt, ROW_NUMBER() OVER (PARTITION BY card_id ORDER BY unix_timestamp(transaction_dt,'yyyy-MM-dd hh:mm:ss') DESC) AS ROW_NUMBER from card_last_ten_transactions) temp where temp.ROW_NUMBER <= 1; 
+
+III.	Performed Join on card_last_ten_transactions, card_ucl and card_zipcode and insert into final hive-hbase integrated lookup table card_transactions_lookup
+insert overwrite table card_transactions_lookup select cs.card_id, cu.ucl, cz.postcode, cz.transaction_dt, cs.score from card_score cs inner join card_ucl cu on cs.card_id = cu.card_id inner join card_zipcode cz on cs.card_id = cz.card_id;
